@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Search, 
   Download, 
@@ -18,11 +18,25 @@ import {
   X,
   Music,
   Type,
-  ClipboardPaste
+  ClipboardPaste,
+  ArrowLeft,
+  Sun,
+  Moon,
+  Sparkles,
+  Image
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI } from "@google/genai";
 import pptxgen from 'pptxgenjs';
 import { jsPDF } from 'jspdf';
+import html2canvas from 'html2canvas';
+import { supabase } from './supabaseClient';
+import LandingPage from './components/LandingPage';
+import Auth from './components/Auth';
+import SlideOptions from './components/SlideOptions';
+import SlidePreview from './components/SlidePreview';
+import CanvaIntegration from './components/CanvaIntegration';
+import bibleFallback from './bible_fallback.json';
 
 interface Verse {
   number: number;
@@ -65,8 +79,14 @@ const THEMES = [
 ];
 
 export default function App() {
-  const [mode, setMode] = useState<'bible' | 'song' | 'paste'>('bible');
+  const [view, setView] = useState<'landing' | 'generator' | 'auth'>('landing');
+  const [user, setUser] = useState<any>(null);
+  const [darkMode, setDarkMode] = useState(false);
+
+  const [mode, setMode] = useState<'bible' | 'song' | 'paste' | 'theme'>('bible');
+  const [useAI, setUseAI] = useState(false);
   const [reference, setReference] = useState('');
+  const [themeInput, setThemeInput] = useState('');
   const [pastedText, setPastedText] = useState('');
   const [pasteType, setPasteType] = useState<'bible' | 'song'>('bible');
   const [language, setLanguage] = useState('Kreyòl');
@@ -85,6 +105,198 @@ export default function App() {
   const [showPrivacy, setShowPrivacy] = useState(false);
   const [showDonation, setShowDonation] = useState(false);
 
+  const [slideStyle, setSlideStyle] = useState({
+    font: "Arial",
+    fontSize: 32,
+    bgColor: "#ffffff",
+    brightness: 100,
+    textColor: "#000000",
+    bgImage: null as string | null,
+  });
+
+  const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
+  const [isGeneratingTheme, setIsGeneratingTheme] = useState(false);
+
+  const adjustBrightness = (hex: string, percent: number) => {
+    const num = parseInt(hex.replace("#", ""), 16);
+    const amt = Math.round(2.55 * (percent - 100));
+    const R = (num >> 16) + amt;
+    const G = ((num >> 8) & 0x00ff) + amt;
+    const B = (num & 0x0000ff) + amt;
+    return (
+      "#" +
+      (
+        0x1000000 +
+        (R < 255 ? (R < 1 ? 0 : R) : 255) * 0x10000 +
+        (G < 255 ? (G < 1 ? 0 : G) : 255) * 0x100 +
+        (B < 255 ? (B < 1 ? 0 : B) : 255)
+      )
+        .toString(16)
+        .slice(1)
+    );
+  };
+
+  const getSlidesForPreview = () => {
+    if (mode === 'bible' && bibleData) {
+      const grouped: string[] = [];
+      for (let i = 0; i < bibleData.verses.length; i += versesPerSlide) {
+        grouped.push(bibleData.verses.slice(i, i + versesPerSlide).map(v => `${v.number}. ${v.text}`).join('\n\n'));
+      }
+      return grouped;
+    } else if (mode === 'song' && songData) {
+      const allLines: string[] = [];
+      songData.lyrics.forEach(part => {
+        for (let i = 0; i < part.lines.length; i += linesPerSlide) {
+          allLines.push(part.lines.slice(i, i + linesPerSlide).join('\n'));
+        }
+      });
+      return allLines;
+    } else if (mode === 'paste' && pastedText) {
+      const lines = pastedText.split(/\r?\n/).filter(l => l.trim() !== "");
+      const chunkSize = pasteType === 'bible' ? versesPerSlide : linesPerSlide;
+      const grouped: string[] = [];
+      for (let i = 0; i < lines.length; i += chunkSize) {
+        grouped.push(lines.slice(i, i + chunkSize).join('\n'));
+      }
+      return grouped;
+    }
+    return [];
+  };
+
+  const previewSlides = getSlidesForPreview();
+
+  useEffect(() => {
+    setCurrentSlideIndex(0);
+  }, [previewSlides.length]);
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      setUser(user);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (user) {
+      loadUserPreferences();
+    }
+  }, [user]);
+
+  const loadUserPreferences = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('user_preferences')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+      
+      if (data && !error) {
+        setSlideStyle(data.preferences);
+      }
+    } catch (err) {
+      console.error("Error loading preferences:", err);
+    }
+  };
+
+  const handleSaveDesign = async (options: any) => {
+    if (!user) return;
+    try {
+      const { error } = await supabase
+        .from('user_preferences')
+        .upsert({ 
+          user_id: user.id, 
+          preferences: options,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id' });
+      
+      if (error) throw error;
+      alert("Design ou sove ak siksè! 🎉");
+    } catch (err) {
+      console.error("Error saving design:", err);
+      alert("Gen yon erè ki rive lè n ap sove design ou.");
+    }
+  };
+
+  const generateByTheme = async () => {
+    if (!themeInput.trim()) return;
+    setIsGeneratingTheme(true);
+    setError(null);
+    setBibleData(null);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Suggest 5 relevant Bible verses for the theme: "${themeInput}" in the language: ${language}. 
+        Return the result as a JSON object with the following structure:
+        {
+          "book": "Tèm: ${themeInput}",
+          "chapter": "AI Sijesyon",
+          "verses": [
+            {"number": 1, "text": "tèks vèsè a..."},
+            ...
+          ],
+          "language": "${language}",
+          "source": "AI Generated"
+        }
+        IMPORTANT: Format the text for professional slides. Use line breaks (\\n) for readability. 
+        Highlight spiritual keywords like "Bondye", "Jezi", "Lavi", "Lafwa" by making them UPPERCASE if appropriate.
+        Ensure the verses are accurate and from a public domain translation.`,
+        config: {
+          responseMimeType: "application/json",
+        }
+      });
+
+      const data = JSON.parse(response.text || "{}");
+      if (!data.verses || data.verses.length === 0) {
+        throw new Error("AI failed to generate verses. Please try a different theme.");
+      }
+
+      setBibleData(data);
+      setMode('bible'); // Switch to bible mode to show results
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setIsGeneratingTheme(false);
+    }
+  };
+
+  const processWithAI = async () => {
+    if (!pastedText.trim()) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch('/api/ai-process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: pastedText }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.error || 'Failed to process text');
+      }
+
+      const data = await response.json();
+      if (data.type === 'bible') {
+        setBibleData(data);
+        setMode('bible');
+      } else if (data.type === 'song') {
+        setSongData(data);
+        setMode('song');
+      }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const fetchVerses = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!reference.trim()) return;
@@ -96,6 +308,20 @@ export default function App() {
 
     try {
       if (mode === 'bible') {
+        // Offline Fallback Check
+        if (!navigator.onLine && bibleFallback[reference as keyof typeof bibleFallback]) {
+          const text = bibleFallback[reference as keyof typeof bibleFallback];
+          setBibleData({
+            book: reference.split(' ')[0],
+            chapter: parseInt(reference.split(' ')[1]) || 1,
+            verses: [{ number: 1, text }],
+            language: 'Kreyòl',
+            source: 'Offline Fallback'
+          });
+          setLoading(false);
+          return;
+        }
+
         const response = await fetch('/api/bible', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -144,6 +370,11 @@ export default function App() {
       nature: { bg: '064E3B', text: 'ECFDF5', accent: '34D399' },
     }[selectedTheme.id as 'light' | 'dark' | 'worship' | 'nature'];
 
+    const adjustedBg = adjustBrightness(slideStyle.bgColor, slideStyle.brightness).replace('#', '');
+    const isDarkBg = slideStyle.brightness < 50 || (parseInt(slideStyle.bgColor.replace('#', ''), 16) < 0x888888 && slideStyle.brightness < 80);
+    const calculatedTextColor = isDarkBg ? 'FFFFFF' : '000000';
+    const textColor = (slideStyle.textColor || calculatedTextColor).replace('#', '');
+
     if (mode === 'bible' && bibleData) {
       // ... existing bible logic ...
       const groupedVerses: Verse[][] = [];
@@ -153,7 +384,18 @@ export default function App() {
 
       groupedVerses.forEach((group) => {
         const slide = pres.addSlide();
-        slide.background = { color: themeColors.bg };
+        if (slideStyle.bgImage) {
+          slide.background = { data: slideStyle.bgImage };
+          // Add overlay for brightness
+          if (slideStyle.brightness < 100) {
+            slide.addShape(pres.ShapeType.rect, {
+              x: 0, y: 0, w: '100%', h: '100%',
+              fill: { color: '000000', transparency: slideStyle.brightness }
+            });
+          }
+        } else {
+          slide.background = { color: adjustedBg };
+        }
 
         if (churchName) {
           slide.addText(churchName, {
@@ -168,11 +410,11 @@ export default function App() {
         const verseText = group.map(v => `${v.number}. ${v.text}`).join('\n\n');
         slide.addText(verseText, {
           x: 1, y: 1, w: '80%', h: '60%',
-          fontSize: group.length > 2 ? 24 : 32,
-          color: themeColors.text,
+          fontSize: group.length > 2 ? slideStyle.fontSize - 8 : slideStyle.fontSize,
+          color: textColor,
           align: 'center',
           valign: 'middle',
-          fontFace: 'Arial'
+          fontFace: slideStyle.font
         });
 
         const refText = `${bibleData.book} ${bibleData.chapter}:${group[0].number}${group.length > 1 ? '-' + group[group.length - 1].number : ''}`;
@@ -189,10 +431,20 @@ export default function App() {
     } else if (mode === 'song' && songData) {
       // ... existing song logic ...
       let sTitle = pres.addSlide();
-      sTitle.background = { color: themeColors.bg };
+      if (slideStyle.bgImage) {
+        sTitle.background = { data: slideStyle.bgImage };
+        if (slideStyle.brightness < 100) {
+          sTitle.addShape(pres.ShapeType.rect, {
+            x: 0, y: 0, w: '100%', h: '100%',
+            fill: { color: '000000', transparency: slideStyle.brightness }
+          });
+        }
+      } else {
+        sTitle.background = { color: adjustedBg };
+      }
       sTitle.addText(songData.title, { 
         x: 1, y: 2.5, w: '80%',
-        fontSize: 44, bold: true, color: themeColors.text, align: 'center' 
+        fontSize: 44, bold: true, color: textColor, align: 'center', fontFace: slideStyle.font
       });
       if (songData.author) {
         sTitle.addText(`Otè: ${songData.author}`, { 
@@ -208,7 +460,17 @@ export default function App() {
         for (let i = 0; i < lines.length; i += linesPerSlide) {
           const chunk = lines.slice(i, i + linesPerSlide);
           const slide = pres.addSlide();
-          slide.background = { color: themeColors.bg };
+          if (slideStyle.bgImage) {
+            slide.background = { data: slideStyle.bgImage };
+            if (slideStyle.brightness < 100) {
+              slide.addShape(pres.ShapeType.rect, {
+                x: 0, y: 0, w: '100%', h: '100%',
+                fill: { color: '000000', transparency: slideStyle.brightness }
+              });
+            }
+          } else {
+            slide.background = { color: adjustedBg };
+          }
 
           if (part) {
             slide.addText(part.toUpperCase(), { 
@@ -219,11 +481,11 @@ export default function App() {
 
           slide.addText(chunk.join("\n"), {
             x: 1, y: 1, w: '80%', h: '60%',
-            fontSize: chunk.length > 2 ? 28 : 36,
-            color: themeColors.text,
+            fontSize: chunk.length > 2 ? slideStyle.fontSize - 8 : slideStyle.fontSize,
+            color: textColor,
             align: "center",
             valign: "middle",
-            fontFace: 'Arial'
+            fontFace: slideStyle.font
           });
 
           slide.addText(`${songData.title} — ${songData.author || ""}`, { 
@@ -241,7 +503,17 @@ export default function App() {
       for (let i = 0; i < lines.length; i += chunkSize) {
         const chunk = lines.slice(i, i + chunkSize);
         const slide = pres.addSlide();
-        slide.background = { color: themeColors.bg };
+        if (slideStyle.bgImage) {
+          slide.background = { data: slideStyle.bgImage };
+          if (slideStyle.brightness < 100) {
+            slide.addShape(pres.ShapeType.rect, {
+              x: 0, y: 0, w: '100%', h: '100%',
+              fill: { color: '000000', transparency: slideStyle.brightness }
+            });
+          }
+        } else {
+          slide.background = { color: adjustedBg };
+        }
 
         if (churchName) {
           slide.addText(churchName, {
@@ -255,11 +527,11 @@ export default function App() {
 
         slide.addText(chunk.join("\n"), {
           x: 1, y: 1, w: '80%', h: '60%',
-          fontSize: chunk.length > 2 ? 24 : 32,
-          color: themeColors.text,
+          fontSize: chunk.length > 2 ? slideStyle.fontSize - 8 : slideStyle.fontSize,
+          color: textColor,
           align: 'center',
           valign: 'middle',
-          fontFace: 'Arial'
+          fontFace: slideStyle.font
         });
       }
       pres.writeFile({ fileName: `BibSlide_Pasted.pptx` });
@@ -282,6 +554,11 @@ export default function App() {
       nature: { bg: '#064E3B', text: '#ECFDF5', accent: '#34D399' },
     }[selectedTheme.id as 'light' | 'dark' | 'worship' | 'nature'];
 
+    const adjustedBg = adjustBrightness(slideStyle.bgColor, slideStyle.brightness);
+    const isDarkBg = slideStyle.brightness < 50 || (parseInt(slideStyle.bgColor.replace('#', ''), 16) < 0x888888 && slideStyle.brightness < 80);
+    const calculatedTextColor = isDarkBg ? '#FFFFFF' : '#000000';
+    const textColor = slideStyle.textColor || calculatedTextColor;
+
     if (mode === 'bible' && bibleData) {
       // ... existing bible logic ...
       const groupedVerses: Verse[][] = [];
@@ -291,8 +568,19 @@ export default function App() {
 
       groupedVerses.forEach((group, index) => {
         if (index > 0) doc.addPage([1280, 720], 'landscape');
-        doc.setFillColor(themeColors.bg);
-        doc.rect(0, 0, 1280, 720, 'F');
+        
+        if (slideStyle.bgImage) {
+          doc.addImage(slideStyle.bgImage, 'JPEG', 0, 0, 1280, 720);
+          if (slideStyle.brightness < 100) {
+            doc.setFillColor(0, 0, 0);
+            doc.setGState(new (doc as any).GState({ opacity: (100 - slideStyle.brightness) / 100 }));
+            doc.rect(0, 0, 1280, 720, 'F');
+            doc.setGState(new (doc as any).GState({ opacity: 1 }));
+          }
+        } else {
+          doc.setFillColor(adjustedBg);
+          doc.rect(0, 0, 1280, 720, 'F');
+        }
 
         if (churchName) {
           doc.setFontSize(24);
@@ -300,8 +588,9 @@ export default function App() {
           doc.text(churchName, 1200, 40, { align: 'right' });
         }
 
-        doc.setTextColor(themeColors.text);
-        const fontSize = group.length > 2 ? 36 : 48;
+        doc.setTextColor(textColor);
+        doc.setFont(slideStyle.font);
+        const fontSize = group.length > 2 ? slideStyle.fontSize * 1.2 : slideStyle.fontSize * 1.5;
         doc.setFontSize(fontSize);
         const verseText = group.map(v => `${v.number}. ${v.text}`).join('\n\n');
         const splitText = doc.splitTextToSize(verseText, 1000);
@@ -318,9 +607,20 @@ export default function App() {
       doc.save(`${bibleData.book}_${bibleData.chapter}.pdf`);
     } else if (mode === 'song' && songData) {
       // ... existing song logic ...
-      doc.setFillColor(themeColors.bg);
-      doc.rect(0, 0, 1280, 720, 'F');
-      doc.setTextColor(themeColors.text);
+      if (slideStyle.bgImage) {
+        doc.addImage(slideStyle.bgImage, 'JPEG', 0, 0, 1280, 720);
+        if (slideStyle.brightness < 100) {
+          doc.setFillColor(0, 0, 0);
+          doc.setGState(new (doc as any).GState({ opacity: (100 - slideStyle.brightness) / 100 }));
+          doc.rect(0, 0, 1280, 720, 'F');
+          doc.setGState(new (doc as any).GState({ opacity: 1 }));
+        }
+      } else {
+        doc.setFillColor(adjustedBg);
+        doc.rect(0, 0, 1280, 720, 'F');
+      }
+      doc.setTextColor(textColor);
+      doc.setFont(slideStyle.font);
       doc.setFontSize(64);
       doc.text(songData.title, 640, 300, { align: 'center' });
       if (songData.author) {
@@ -336,8 +636,18 @@ export default function App() {
         for (let i = 0; i < lines.length; i += linesPerSlide) {
           const chunk = lines.slice(i, i + linesPerSlide);
           doc.addPage([1280, 720], 'landscape');
-          doc.setFillColor(themeColors.bg);
-          doc.rect(0, 0, 1280, 720, 'F');
+          if (slideStyle.bgImage) {
+            doc.addImage(slideStyle.bgImage, 'JPEG', 0, 0, 1280, 720);
+            if (slideStyle.brightness < 100) {
+              doc.setFillColor(0, 0, 0);
+              doc.setGState(new (doc as any).GState({ opacity: (100 - slideStyle.brightness) / 100 }));
+              doc.rect(0, 0, 1280, 720, 'F');
+              doc.setGState(new (doc as any).GState({ opacity: 1 }));
+            }
+          } else {
+            doc.setFillColor(adjustedBg);
+            doc.rect(0, 0, 1280, 720, 'F');
+          }
 
           if (part) {
             doc.setFontSize(24);
@@ -345,8 +655,9 @@ export default function App() {
             doc.text(part.toUpperCase(), 40, 40);
           }
 
-          doc.setTextColor(themeColors.text);
-          const fontSize = chunk.length > 2 ? 40 : 56;
+          doc.setTextColor(textColor);
+          doc.setFont(slideStyle.font);
+          const fontSize = chunk.length > 2 ? slideStyle.fontSize * 1.2 : slideStyle.fontSize * 1.5;
           doc.setFontSize(fontSize);
           const verseText = chunk.join("\n");
           const splitText = doc.splitTextToSize(verseText, 1000);
@@ -368,8 +679,18 @@ export default function App() {
       for (let i = 0; i < lines.length; i += chunkSize) {
         const chunk = lines.slice(i, i + chunkSize);
         if (i > 0) doc.addPage([1280, 720], 'landscape');
-        doc.setFillColor(themeColors.bg);
-        doc.rect(0, 0, 1280, 720, 'F');
+        if (slideStyle.bgImage) {
+          doc.addImage(slideStyle.bgImage, 'JPEG', 0, 0, 1280, 720);
+          if (slideStyle.brightness < 100) {
+            doc.setFillColor(0, 0, 0);
+            doc.setGState(new (doc as any).GState({ opacity: (100 - slideStyle.brightness) / 100 }));
+            doc.rect(0, 0, 1280, 720, 'F');
+            doc.setGState(new (doc as any).GState({ opacity: 1 }));
+          }
+        } else {
+          doc.setFillColor(adjustedBg);
+          doc.rect(0, 0, 1280, 720, 'F');
+        }
 
         if (churchName) {
           doc.setFontSize(24);
@@ -377,8 +698,9 @@ export default function App() {
           doc.text(churchName, 1200, 40, { align: 'right' });
         }
 
-        doc.setTextColor(themeColors.text);
-        const fontSize = chunk.length > 2 ? 36 : 48;
+        doc.setTextColor(textColor);
+        doc.setFont(slideStyle.font);
+        const fontSize = chunk.length > 2 ? slideStyle.fontSize * 1.2 : slideStyle.fontSize * 1.5;
         doc.setFontSize(fontSize);
         const text = chunk.join("\n");
         const splitText = doc.splitTextToSize(text, 1000);
@@ -390,21 +712,74 @@ export default function App() {
     }
   };
 
+  const generatePNG = async () => {
+    const previewElement = document.querySelector('.slide-preview-container') as HTMLElement;
+    if (previewElement) {
+      try {
+        const canvas = await html2canvas(previewElement, {
+          useCORS: true,
+          scale: 2,
+        });
+        const link = document.createElement('a');
+        link.download = `BibSlide_${Date.now()}.png`;
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+      } catch (err) {
+        console.error("Error generating PNG:", err);
+      }
+    }
+  };
+
+  if (view === 'landing') {
+    return (
+      <LandingPage 
+        onStart={() => setView('generator')} 
+        onLogin={() => setView('auth')}
+        darkMode={darkMode}
+        setDarkMode={setDarkMode}
+        user={user}
+      />
+    );
+  }
+
+  if (view === 'auth') {
+    return (
+      <Auth 
+        onBack={() => setView('landing')}
+        darkMode={darkMode}
+      />
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-slate-50 font-sans text-slate-900">
+    <div className={`min-h-screen transition-colors duration-500 ${darkMode ? 'bg-slate-900 text-white' : 'bg-slate-50 text-slate-900'}`}>
       {/* Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-10">
+      <header className={`border-b sticky top-0 z-10 transition-colors ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
         <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="bg-indigo-600 p-2 rounded-lg">
-              <BookOpen className="text-white w-6 h-6" />
-            </div>
-            <h1 className="text-xl font-bold tracking-tight text-slate-900">BibSlide</h1>
+            <button onClick={() => setView('landing')} className="p-1 hover:opacity-80 transition-opacity">
+              <img 
+                src="https://i.postimg.cc/X7j5bZCj/biblslide.png" 
+                alt="BibSlide Logo" 
+                className="w-10 h-10 object-contain"
+                referrerPolicy="no-referrer"
+              />
+            </button>
+            <h1 className="text-xl font-bold tracking-tight text-indigo-600">BibSlide</h1>
           </div>
-          <div className="hidden sm:flex items-center gap-4 text-sm font-medium text-slate-500">
-            <span>Legliz</span>
-            <ChevronRight className="w-4 h-4" />
-            <span className="text-indigo-600">Jeneratè Slide</span>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              className={`p-2 rounded-xl border transition-all ${darkMode ? 'bg-slate-800 border-slate-700 text-yellow-400' : 'bg-slate-50 border-slate-200 text-indigo-600'}`}
+            >
+              {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+            <button 
+              onClick={() => setView('landing')}
+              className="flex items-center gap-2 text-sm font-bold text-indigo-600 hover:underline"
+            >
+              <ArrowLeft className="w-4 h-4" /> Retounen
+            </button>
           </div>
         </div>
       </header>
@@ -442,57 +817,117 @@ export default function App() {
           >
             <ClipboardPaste className="w-5 h-5" /> Kole
           </button>
+          <button 
+            onClick={() => { setMode('theme'); setError(null); setBibleData(null); setSongData(null); }}
+            className={`flex-1 py-3 rounded-2xl font-bold flex items-center justify-center gap-2 transition-all ${
+              mode === 'theme' 
+              ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200' 
+              : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50'
+            }`}
+          >
+            <Sparkles className="w-5 h-5" /> Tèm AI
+          </button>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           
           {/* Left Column: Input & Config */}
           <div className="lg:col-span-1 space-y-6">
-            <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+            <section className={`p-6 rounded-2xl shadow-sm border transition-colors ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
               <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-4 flex items-center gap-2">
-                <Search className="w-4 h-4" /> {mode === 'bible' ? 'Rechèch Pasaj' : mode === 'song' ? 'Rechèch Chante' : 'Kole Tèks'}
+                <Search className="w-4 h-4" /> {mode === 'bible' ? 'Rechèch Pasaj' : mode === 'song' ? 'Rechèch Chante' : mode === 'theme' ? 'Tèm AI' : 'Kole Tèks'}
               </h2>
-              {mode === 'paste' ? (
+              {mode === 'theme' ? (
                 <div className="space-y-4">
-                  <textarea
-                    rows={8}
-                    value={pastedText}
-                    onChange={(e) => setPastedText(e.target.value)}
-                    placeholder="Kole chante ou oswa pasaj Biblik la isit la..."
-                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-sm"
-                  />
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => setPasteType('bible')}
-                      className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
-                        pasteType === 'bible' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-600'
-                      }`}
-                    >
-                      Vèsè 📖
-                    </button>
-                    <button
-                      onClick={() => setPasteType('song')}
-                      className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
-                        pasteType === 'song' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-600'
-                      }`}
-                    >
-                      Chante 🎵
-                    </button>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-1">Ki tèm ou vle? (eg: Lapè, Lafwa, Renmen)</label>
+                    <input 
+                      type="text" 
+                      value={themeInput}
+                      onChange={(e) => setThemeInput(e.target.value)}
+                      placeholder="Eg: Lapè nan kè..."
+                      className={`w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}
+                    />
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button 
-                      onClick={generatePPTX}
-                      className="bg-emerald-600 hover:bg-emerald-700 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-100 transition-all active:scale-95"
-                    >
-                      <Download className="w-4 h-4" /> PPTX
-                    </button>
-                    <button 
-                      onClick={generatePDF}
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-indigo-100 transition-all active:scale-95"
-                    >
-                      <Download className="w-4 h-4" /> PDF
-                    </button>
+                  <button 
+                    onClick={generateByTheme}
+                    disabled={isGeneratingTheme}
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {isGeneratingTheme ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+                    Jenere pa Tèm
+                  </button>
+                </div>
+              ) : mode === 'paste' ? (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="flex items-center gap-2 cursor-pointer group">
+                      <div className={`w-10 h-5 rounded-full transition-colors relative ${useAI ? 'bg-indigo-600' : 'bg-slate-200'}`}>
+                        <input 
+                          type="checkbox" 
+                          className="sr-only" 
+                          checked={useAI} 
+                          onChange={() => setUseAI(!useAI)} 
+                        />
+                        <div className={`absolute top-1 left-1 w-3 h-3 bg-white rounded-full transition-transform ${useAI ? 'translate-x-5' : ''}`} />
+                      </div>
+                      <span className="text-xs font-bold text-slate-600 group-hover:text-indigo-600 transition-colors">
+                        {useAI ? "Mode AI (Gemini)" : "Mode Manuel"}
+                      </span>
+                    </label>
                   </div>
+                    <textarea
+                      rows={8}
+                      value={pastedText}
+                      onChange={(e) => setPastedText(e.target.value)}
+                      placeholder={useAI ? "Egzanp: 1 Wa 21:1-7 an Kreyòl oswa kole yon chante..." : "Kole chante ou oswa pasaj Biblik la isit la..."}
+                      className={`w-full px-4 py-3 border rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-sm ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}
+                    />
+                  {useAI ? (
+                    <button 
+                      onClick={processWithAI}
+                      disabled={loading}
+                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
+                      Analize ak Gemini
+                    </button>
+                  ) : (
+                    <>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setPasteType('bible')}
+                          className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
+                            pasteType === 'bible' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          Vèsè 📖
+                        </button>
+                        <button
+                          onClick={() => setPasteType('song')}
+                          className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
+                            pasteType === 'song' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          Chante 🎵
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button 
+                          onClick={generatePPTX}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-100 transition-all active:scale-95"
+                        >
+                          <Download className="w-4 h-4" /> PPTX
+                        </button>
+                        <button 
+                          onClick={generatePDF}
+                          className="bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-indigo-100 transition-all active:scale-95"
+                        >
+                          <Download className="w-4 h-4" /> PDF
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               ) : (
                 <form onSubmit={fetchVerses} className="space-y-4">
@@ -500,13 +935,13 @@ export default function App() {
                     <label className="block text-xs font-medium text-slate-500 mb-1">
                       {mode === 'bible' ? 'Referans (eg: 1 Wa 21:1-7)' : 'Tit oswa Nimewo (eg: 17 Chant d\'Espérance)'}
                     </label>
-                    <input 
-                      type="text" 
-                      value={reference}
-                      onChange={(e) => setReference(e.target.value)}
-                      placeholder={mode === 'bible' ? "Matye 5:1-12" : "Mwen byen kontan..."}
-                      className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all"
-                    />
+                      <input 
+                        type="text" 
+                        value={reference}
+                        onChange={(e) => setReference(e.target.value)}
+                        placeholder={mode === 'bible' ? "Matye 5:1-12" : "Mwen byen kontan..."}
+                        className={`w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}
+                      />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-500 mb-1">Tradiksyon</label>
@@ -538,7 +973,7 @@ export default function App() {
               )}
             </section>
 
-            <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+            <section className={`p-6 rounded-2xl shadow-sm border transition-colors ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
               <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-4 flex items-center gap-2">
                 <Settings className="w-4 h-4" /> Opsyon Slide
               </h2>
@@ -551,7 +986,7 @@ export default function App() {
                     <select 
                       value={versesPerSlide}
                       onChange={(e) => setVersesPerSlide(Number(e.target.value))}
-                      className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                      className={`w-full px-4 py-2 border rounded-xl outline-none ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}
                     >
                       <option value={1}>1 vèsè pa slide</option>
                       <option value={2}>2 vèsè pa slide</option>
@@ -567,7 +1002,7 @@ export default function App() {
                     <select 
                       value={linesPerSlide}
                       onChange={(e) => setLinesPerSlide(Number(e.target.value))}
-                      className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                      className={`w-full px-4 py-2 border rounded-xl outline-none ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}
                     >
                       <option value={1}>1 liy pa slide</option>
                       <option value={2}>2 liy pa slide</option>
@@ -606,11 +1041,18 @@ export default function App() {
                     value={churchName}
                     onChange={(e) => setChurchName(e.target.value)}
                     placeholder="Eglise de Dieu..."
-                    className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                    className={`w-full px-4 py-2 border rounded-xl outline-none ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}
                   />
                 </div>
               </div>
             </section>
+
+            <SlideOptions 
+              onChange={setSlideStyle} 
+              onSave={handleSaveDesign}
+              darkMode={darkMode} 
+              isLoggedIn={!!user}
+            />
           </div>
 
           {/* Right Column: Preview & Download */}
@@ -640,10 +1082,10 @@ export default function App() {
                   className="space-y-6"
                 >
                   {/* Preview Section */}
-                  <div className="bg-white p-8 rounded-3xl shadow-xl border border-slate-200">
+                  <div className={`p-8 rounded-3xl shadow-xl border transition-colors ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
                     <div className="flex items-center justify-between mb-8">
                       <div>
-                        <h3 className="text-2xl font-bold text-slate-900">
+                        <h3 className={`text-2xl font-bold ${darkMode ? 'text-white' : 'text-slate-900'}`}>
                           {mode === 'bible' && bibleData ? `${bibleData.book} ${bibleData.chapter}` : mode === 'song' ? songData?.title : 'Aperçu Tèks'}
                         </h3>
                         <p className="text-sm text-slate-500 flex items-center gap-1">
@@ -664,65 +1106,58 @@ export default function App() {
                         >
                           <Download className="w-5 h-5" /> PDF
                         </button>
+                        <button 
+                          onClick={generatePNG}
+                          className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-blue-100 transition-all active:scale-95"
+                        >
+                          <Image className="w-5 h-5" /> PNG
+                        </button>
                       </div>
                     </div>
 
                     <div className="space-y-6 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
                       {mode === 'bible' && bibleData ? (
                         bibleData.verses.map((verse, idx) => (
-                          <div key={`${verse.number}-${idx}`} className="group flex gap-4 p-4 rounded-2xl hover:bg-slate-50 transition-colors">
+                          <div key={`${verse.number}-${idx}`} className={`group flex gap-4 p-4 rounded-2xl transition-colors ${darkMode ? 'hover:bg-slate-700' : 'hover:bg-slate-50'}`}>
                             <span className="text-indigo-600 font-bold text-lg leading-none pt-1">{verse.number}</span>
-                            <p className="text-slate-700 leading-relaxed">{verse.text}</p>
+                            <p className={`${darkMode ? 'text-slate-200' : 'text-slate-700'} leading-relaxed`}>{verse.text}</p>
                           </div>
                         ))
                       ) : mode === 'song' && songData ? (
                         songData.lyrics.map((part, pIdx) => (
                           <div key={`part-${pIdx}`} className="space-y-2">
                             <h4 className="text-xs font-bold uppercase tracking-widest text-indigo-600">{part.part}</h4>
-                            <div className="bg-slate-50 p-4 rounded-2xl space-y-1">
+                            <div className={`p-4 rounded-2xl space-y-1 ${darkMode ? 'bg-slate-700' : 'bg-slate-50'}`}>
                               {part.lines.map((line, lIdx) => (
-                                <p key={`line-${pIdx}-${lIdx}`} className="text-slate-700">{line}</p>
+                                <p key={`line-${pIdx}-${lIdx}`} className={`${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>{line}</p>
                               ))}
                             </div>
                           </div>
                         ))
                       ) : mode === 'paste' && pastedText ? (
-                        <div className="bg-slate-50 p-6 rounded-2xl whitespace-pre-wrap text-slate-700 leading-relaxed">
+                        <div className={`p-6 rounded-2xl whitespace-pre-wrap leading-relaxed ${darkMode ? 'bg-slate-700 text-slate-200' : 'bg-slate-50 text-slate-700'}`}>
                           {pastedText}
                         </div>
                       ) : null}
                     </div>
                   </div>
 
-                  {/* Visual Preview of a Slide */}
-                  <div className="bg-slate-200 p-4 rounded-3xl border-4 border-white shadow-inner">
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 text-center">Aperçu Slide</p>
-                    <div className={`${selectedTheme.bg} aspect-video rounded-xl shadow-2xl flex flex-col items-center justify-center p-8 relative overflow-hidden transition-all duration-500`}>
-                      {churchName && (
-                        <p className={`absolute top-4 right-6 text-[10px] italic ${selectedTheme.text} opacity-40`}>{churchName}</p>
-                      )}
-                      <div className="text-center space-y-4">
-                        <p className={`text-lg sm:text-2xl font-medium leading-tight ${selectedTheme.text}`}>
-                          {mode === 'bible' && bibleData ? (
-                            `${bibleData.verses[0].number}. ${bibleData.verses[0].text.length > 100 ? bibleData.verses[0].text.substring(0, 100) + '...' : bibleData.verses[0].text}`
-                          ) : mode === 'song' && songData ? (
-                            songData.lyrics[0].lines[0]
-                          ) : mode === 'paste' && pastedText ? (
-                            pastedText.split('\n')[0]
-                          ) : ''}
-                        </p>
-                      </div>
-                      <p className={`absolute bottom-4 text-xs font-bold ${selectedTheme.text} opacity-60`}>
-                        {mode === 'bible' && bibleData ? (
-                          `${bibleData.book} ${bibleData.chapter}:${bibleData.verses[0].number}`
-                        ) : mode === 'song' && songData ? (
-                          `${songData.title} — ${songData.author || ''}`
-                        ) : mode === 'paste' && pastedText ? (
-                          'BibSlide — Paste & Convert'
-                        ) : ''}
-                      </p>
-                    </div>
+                  {/* Live Preview Section */}
+                  <div className="slide-preview-container">
+                    <SlidePreview 
+                      slides={previewSlides} 
+                      current={currentSlideIndex}
+                      setCurrent={setCurrentSlideIndex}
+                      options={slideStyle} 
+                      darkMode={darkMode} 
+                    />
                   </div>
+
+                  {/* Canva Integration Section */}
+                  <CanvaIntegration 
+                    currentText={previewSlides[currentSlideIndex] || ""} 
+                    darkMode={darkMode} 
+                  />
                 </motion.div>
               ) : !loading && (
                 <motion.div 
@@ -760,10 +1195,12 @@ export default function App() {
         </div>
       </main>
 
-      <footer className="bg-slate-100 text-center text-slate-600 py-10 border-t mt-12">
+      <footer className={`text-center py-10 border-t mt-12 transition-colors ${darkMode ? 'bg-slate-900 border-slate-800 text-slate-400' : 'bg-slate-100 border-slate-200 text-slate-600'}`}>
         <div className="max-w-5xl mx-auto px-4">
           <p className="text-sm">
-            © 2024 <strong>BibSlide</strong> — Zouti pou Legliz.  
+            © 2024 <strong>BibSlide</strong> — Zouti pou Legliz.
+          </p>
+          <p className="text-xs mt-1">
             Powered by <strong>Wanky Massenat</strong>.
           </p>
           <div className="flex justify-center gap-4 mt-4 text-sm font-medium flex-wrap">
